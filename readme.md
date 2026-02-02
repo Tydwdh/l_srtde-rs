@@ -33,7 +33,7 @@ Since this crate is hosted on GitHub, you can add it to your `Cargo.toml` as a G
 
 ```toml
 [dependencies]
-l_srtde = { git = "[https://github.com/Tydwdh/l_srtde-rs](https://github.com/Tydwdh/l_srtde-rs)", branch = "main" }
+l_srtde = { git = "https://github.com/Tydwdh/l_srtde-rs", branch = "main" }
 ```
 
 
