@@ -41,7 +41,7 @@ l_srtde = { git = "https://github.com/Tydwdh/l_srtde-rs", branch = "main" }
 🚀 Quick Start
 Here is a simple example solving the Sphere function ($f(x) = \sum x_i^2$).
 ```Rust
-use l_srtde::{Lsrtde, Problem, Solution};
+use l_srtde::{Lsrtde, Problem};
 
 // 1. Define the problem structure
 struct SphereProblem {
@@ -54,11 +54,11 @@ impl Problem for SphereProblem {
         self.dim
     }
 
-    fn get_bounds(&self, _index: usize) -> (f32, f32) {
+    fn get_bounds(&self, _index: usize) -> (f64, f64) {
         (-100.0, 100.0)
     }
 
-    fn evaluate(&self, genome: &[f32]) -> f32 {
+    fn evaluate(&self, genome: &[f64]) -> f64 {
         // Goal: Minimize the sum of squares
         genome.iter().map(|x| x * x).sum()
     }
@@ -70,8 +70,8 @@ fn main() {
 
     // Configure the solver
     let solver = Lsrtde::new(&problem)
-        .with_max_evaluations(50_000) // Set max function evaluations
-        .with_seed(42);               // Set a fixed seed for reproducibility
+        .with_max_evaluations(500_000) // Set max function evaluations
+        .with_seed(42); // Set a fixed seed for reproducibility
 
     println!("Running L-SRTDE on {}D Sphere problem...", problem.dim);
 
@@ -80,7 +80,9 @@ fn main() {
 
     println!("Optimization Finished!");
     println!("Best Fitness: {:.6e}", solution.fitness);
+    println!("Best Genome: {:.2?}", solution.genome);
 }
+
 ```
 ⚙️ Advanced Configuration
 You can customize the solver using the builder pattern:
