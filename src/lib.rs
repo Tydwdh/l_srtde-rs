@@ -30,7 +30,7 @@
 //! ## 快速开始 (Quick Start)
 //!
 //! ```rust
-//! use lsrtde::{Lsrtde, Problem, Solution};
+//! use l_srtde::{Lsrtde, Problem, Solution};
 //!
 //! // 1. 定义你的问题
 //! struct SphereProblem {
