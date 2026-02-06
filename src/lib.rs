@@ -214,7 +214,7 @@ impl<'a, P: Problem> Lsrtde<'a, P> {
     /// 找到的全局最优解 `Solution`。
     #[inline]
     pub fn run(&self) -> Solution {
-        self.run_core(|_, _| true)
+        self.run_with_callback(|_, _| true)
     }
 
     /// 运行优化算法，并支持每代回调。
@@ -227,15 +227,7 @@ impl<'a, P: Problem> Lsrtde<'a, P> {
     ///
     /// # Returns
     /// 终止时找到的全局最优解。
-    pub fn run_with_callback<F>(&self, callback: F) -> Solution
-    where
-        F: FnMut(&Solution, usize) -> bool,
-    {
-        self.run_core(callback)
-    }
-
-    /// 核心运行逻辑 (内部实现)。
-    fn run_core<F>(&self, mut callback: F) -> Solution
+    pub fn run_with_callback<F>(&self, mut callback: F) -> Solution
     where
         F: FnMut(&Solution, usize) -> bool,
     {
