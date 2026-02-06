@@ -97,11 +97,15 @@ let solver = Lsrtde::new(&problem)
 You can also use a callback to monitor progress or implement custom stopping criteria:
 
 ```Rust
-solver.run_with_callback(|solution, evaluations| {
-    if evaluations % 1000 == 0 {
+let mut generation = 0;
+let solution = solver.run_with_callback(move |solution, evaluations| {
+    generation += 1;
+
+    if generation % 10 == 0 {
         println!("Eval: {}, Current Best: {}", evaluations, solution.fitness);
     }
-    true // Return false to stop early
+
+    true
 });
 ```
 ⚖️ License
