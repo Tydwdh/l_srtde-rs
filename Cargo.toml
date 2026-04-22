@@ -2,6 +2,10 @@
 name = "l_srtde"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Rust implementation of the L-SRTDE algorithm for large-scale global optimization."
+repository = "https://github.com/Tydwdh/l_srtde-rs"
+readme = "readme.md"
 
 [dependencies]
 rand = "0.9.2"
