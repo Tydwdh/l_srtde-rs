@@ -1,11 +1,15 @@
 [package]
 name = "l_srtde"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 description = "Rust implementation of the L-SRTDE algorithm for large-scale global optimization."
 repository = "https://github.com/Tydwdh/l_srtde-rs"
 readme = "README.md"
+documentation = "https://docs.rs/l_srtde"
+keywords = ["optimization", "evolutionary", "metaheuristic", "lsgo", "parallel"]
+categories = ["algorithms", "mathematics", "science"]
 
 [dependencies]
 rand = "0.10.1"

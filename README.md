@@ -31,7 +31,7 @@ If you use the algorithm or this code in research, cite the original paper:
 
 ```toml
 [dependencies]
-l_srtde = { git = "https://github.com/Tydwdh/l_srtde-rs", branch = "main" }
+l_srtde = "0.1.1"
 ```
 
 ## Quick Start
