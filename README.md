@@ -26,12 +26,13 @@ If you use the algorithm or this code in research, cite the original paper:
 - Linear population size reduction (LPSR)
 - Random-topology strategy for large search spaces
 - Pure Rust implementation
+- C ABI dynamic library for non-Rust callers
 
 ## Installation
 
 ```toml
 [dependencies]
-l_srtde = "0.1.1"
+l_srtde = "0.1.2"
 ```
 
 ## Quick Start
@@ -96,6 +97,94 @@ let solution = solver.run_with_callback(move |solution, evaluations| {
     true
 })?;
 ```
+
+## C ABI / Dynamic Library
+
+The crate can also be built as a dynamic library for C, C++, Python `ctypes`,
+and other languages that can load a C ABI library.
+
+Build the release library:
+
+```bash
+cargo build --release
+```
+
+The dynamic library is written to `target/release`:
+
+- Windows: `l_srtde.dll`
+- Linux: `libl_srtde.so`
+- macOS: `libl_srtde.dylib`
+
+Use `include/l_srtde.h` from C:
+
+```c
+#include "l_srtde.h"
+
+static int32_t sphere_batch(
+    const double *points,
+    size_t point_count,
+    size_t dim,
+    double *fitness_out,
+    void *user_data
+) {
+    (void)user_data;
+    for (size_t i = 0; i < point_count; ++i) {
+        double sum = 0.0;
+        for (size_t j = 0; j < dim; ++j) {
+            double x = points[i * dim + j];
+            sum += x * x;
+        }
+        fitness_out[i] = sum;
+    }
+    return LSRTDE_OK;
+}
+```
+
+The callback receives a row-major batch of `point_count * dim` doubles and must
+write `point_count` fitness values. Return `0` on success and a non-zero value
+to stop the optimization with `LSRTDE_CALLBACK_ERROR`.
+
+Example link commands:
+
+```bash
+# Linux/macOS
+cc main.c -Iinclude -Ltarget/release -ll_srtde -o main
+
+# Windows MSVC
+cl main.c /I include target\release\l_srtde.dll.lib
+```
+
+Minimal Python `ctypes` loading:
+
+```python
+import ctypes
+
+lib = ctypes.CDLL("./l_srtde.dll")  # use ./libl_srtde.so or ./libl_srtde.dylib on Unix
+lib.lsrtde_minimize.restype = ctypes.c_int32
+
+CALLBACK = ctypes.CFUNCTYPE(
+    ctypes.c_int32,
+    ctypes.POINTER(ctypes.c_double),
+    ctypes.c_size_t,
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_double),
+    ctypes.c_void_p,
+)
+
+@CALLBACK
+def sphere(points, point_count, dim, fitness_out, user_data):
+    for i in range(point_count):
+        total = 0.0
+        for j in range(dim):
+            x = points[i * dim + j]
+            total += x * x
+        fitness_out[i] = total
+    return 0
+```
+
+When a C ABI config field is set to zero, `max_evaluations`, `memory_size`, and
+`pop_size_multiplier` use the Rust defaults. Set `use_seed` to `0` for a random
+seed or non-zero to use `seed`.
 
 ## Validation And Budget Semantics
 
