@@ -6,6 +6,11 @@
 //! The solver evaluates the population in parallel with `rayon` and adapts the
 //! scaling factor `F` using the success rate of the current generation.
 //!
+//! ## Chinese Documentation
+//!
+//! 简体中文说明见
+//! [README.zh-CN.md](https://github.com/Tydwdh/l_srtde-rs/blob/main/README.zh-CN.md)。
+//!
 //! ## Soft Evaluation Budget
 //!
 //! `with_max_evaluations()` configures a soft budget, not a strict hard limit.
@@ -48,7 +53,7 @@
 
 use core::fmt;
 use std::error::Error;
-use std::ffi::{c_char, c_void};
+use std::ffi::c_void;
 
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;
@@ -60,55 +65,13 @@ const DEFAULT_MAX_EVALUATIONS: usize = 100_000;
 const DEFAULT_MEMORY_SIZE: usize = 5;
 const DEFAULT_POP_SIZE_MULTIPLIER: usize = 18;
 
-/// C ABI status code for a successful run.
-pub const LSRTDE_OK: i32 = 0;
-/// C ABI status code for a null configuration pointer.
-pub const LSRTDE_NULL_CONFIG: i32 = 1;
-/// C ABI status code for null lower or upper bounds.
-pub const LSRTDE_NULL_BOUNDS: i32 = 2;
-/// C ABI status code for a null objective callback.
-pub const LSRTDE_NULL_CALLBACK: i32 = 3;
-/// C ABI status code for null output pointers.
-pub const LSRTDE_NULL_OUTPUT: i32 = 4;
-/// C ABI status code for a zero dimension.
-pub const LSRTDE_INVALID_DIMENSION: i32 = 5;
-/// C ABI status code for population-size overflow.
-pub const LSRTDE_POPULATION_OVERFLOW: i32 = 6;
-/// C ABI status code for an initial population below the algorithm minimum.
-pub const LSRTDE_POPULATION_TOO_SMALL: i32 = 7;
-/// C ABI status code for invalid bounds.
-pub const LSRTDE_INVALID_BOUNDS: i32 = 8;
-/// C ABI status code for a non-zero objective callback return.
-pub const LSRTDE_CALLBACK_ERROR: i32 = 9;
-/// C ABI status code for NaN or infinite callback fitness.
-pub const LSRTDE_NONFINITE_FITNESS: i32 = 10;
-
-/// C ABI batch objective callback.
-///
-/// `points` is a row-major array with `point_count * dim` doubles. The callback
-/// must write `point_count` fitness values into `fitness_out` and return 0 on
-/// success.
-pub type LsrtdeEvaluateBatchFn = unsafe extern "C" fn(
-    points: *const f64,
-    point_count: usize,
-    dim: usize,
-    fitness_out: *mut f64,
-    user_data: *mut c_void,
-) -> i32;
-
-/// C ABI solver configuration.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct LsrtdeConfig {
-    pub dim: usize,
-    pub lower_bounds: *const f64,
-    pub upper_bounds: *const f64,
-    pub max_evaluations: usize,
-    pub memory_size: usize,
-    pub pop_size_multiplier: usize,
-    pub seed: u64,
-    pub use_seed: u8,
-}
+#[doc(hidden)]
+pub use ffi::{
+    LSRTDE_CALLBACK_ERROR, LSRTDE_INVALID_BOUNDS, LSRTDE_INVALID_DIMENSION,
+    LSRTDE_NONFINITE_FITNESS, LSRTDE_NULL_BOUNDS, LSRTDE_NULL_CALLBACK, LSRTDE_NULL_CONFIG,
+    LSRTDE_NULL_OUTPUT, LSRTDE_OK, LSRTDE_POPULATION_OVERFLOW, LSRTDE_POPULATION_TOO_SMALL,
+    LsrtdeConfig, LsrtdeEvaluateBatchFn, lsrtde_error_message, lsrtde_minimize,
+};
 
 /// Defines an optimization problem that can be solved by [`Lsrtde`].
 ///
@@ -226,7 +189,7 @@ enum FfiEvaluationError {
 }
 
 struct FfiEvaluator {
-    callback: LsrtdeEvaluateBatchFn,
+    callback: ffi::LsrtdeEvaluateBatchFn,
     user_data: *mut c_void,
 }
 
@@ -258,7 +221,7 @@ impl CandidateEvaluator for FfiEvaluator {
             )
         };
 
-        if status != LSRTDE_OK {
+        if status != ffi::LSRTDE_OK {
             return Err(FfiEvaluationError::Callback);
         }
 
@@ -893,15 +856,15 @@ fn validate_ffi_problem_config(
     pop_size_multiplier: usize,
 ) -> Result<ValidatedConfig, i32> {
     if dim == 0 {
-        return Err(LSRTDE_INVALID_DIMENSION);
+        return Err(ffi::LSRTDE_INVALID_DIMENSION);
     }
 
     let pop_size_init = pop_size_multiplier
         .checked_mul(dim)
-        .ok_or(LSRTDE_POPULATION_OVERFLOW)?;
+        .ok_or(ffi::LSRTDE_POPULATION_OVERFLOW)?;
 
     if pop_size_init < 3 {
-        return Err(LSRTDE_POPULATION_TOO_SMALL);
+        return Err(ffi::LSRTDE_POPULATION_TOO_SMALL);
     }
 
     let mut bounds = Vec::with_capacity(dim);
@@ -909,7 +872,7 @@ fn validate_ffi_problem_config(
         let lower = lower_bounds[index];
         let upper = upper_bounds[index];
         if !lower.is_finite() || !upper.is_finite() || lower >= upper {
-            return Err(LSRTDE_INVALID_BOUNDS);
+            return Err(ffi::LSRTDE_INVALID_BOUNDS);
         }
         bounds.push((lower, upper));
     }
@@ -921,118 +884,183 @@ fn validate_ffi_problem_config(
     })
 }
 
-/// Runs L-SRTDE through the C ABI.
+/// Low-level C ABI interface.
 ///
-/// The caller owns all pointed-to memory. `best_genome_out` must have room for
-/// `config->dim` doubles.
-#[unsafe(no_mangle)]
-pub extern "C" fn lsrtde_minimize(
-    config: *const LsrtdeConfig,
-    evaluate_batch: Option<LsrtdeEvaluateBatchFn>,
-    user_data: *mut c_void,
-    best_genome_out: *mut f64,
-    best_fitness_out: *mut f64,
-) -> i32 {
-    if config.is_null() {
-        return LSRTDE_NULL_CONFIG;
+/// Rust users should normally use [`Lsrtde`] and [`Problem`]. This module exists
+/// for C, C++, Python `ctypes`, and other callers that need a stable C ABI.
+pub mod ffi {
+    use std::ffi::{c_char, c_void};
+
+    use super::{
+        DEFAULT_MAX_EVALUATIONS, DEFAULT_MEMORY_SIZE, DEFAULT_POP_SIZE_MULTIPLIER,
+        FfiEvaluationError, FfiEvaluator, RunSettings, run_validated_with_evaluator,
+        validate_ffi_problem_config,
+    };
+
+    /// C ABI status code for a successful run.
+    pub const LSRTDE_OK: i32 = 0;
+    /// C ABI status code for a null configuration pointer.
+    pub const LSRTDE_NULL_CONFIG: i32 = 1;
+    /// C ABI status code for null lower or upper bounds.
+    pub const LSRTDE_NULL_BOUNDS: i32 = 2;
+    /// C ABI status code for a null objective callback.
+    pub const LSRTDE_NULL_CALLBACK: i32 = 3;
+    /// C ABI status code for null output pointers.
+    pub const LSRTDE_NULL_OUTPUT: i32 = 4;
+    /// C ABI status code for a zero dimension.
+    pub const LSRTDE_INVALID_DIMENSION: i32 = 5;
+    /// C ABI status code for population-size overflow.
+    pub const LSRTDE_POPULATION_OVERFLOW: i32 = 6;
+    /// C ABI status code for an initial population below the algorithm minimum.
+    pub const LSRTDE_POPULATION_TOO_SMALL: i32 = 7;
+    /// C ABI status code for invalid bounds.
+    pub const LSRTDE_INVALID_BOUNDS: i32 = 8;
+    /// C ABI status code for a non-zero objective callback return.
+    pub const LSRTDE_CALLBACK_ERROR: i32 = 9;
+    /// C ABI status code for NaN or infinite callback fitness.
+    pub const LSRTDE_NONFINITE_FITNESS: i32 = 10;
+
+    /// C ABI batch objective callback.
+    ///
+    /// `points` is a row-major array with `point_count * dim` doubles. The
+    /// callback must write `point_count` fitness values into `fitness_out` and
+    /// return 0 on success.
+    pub type LsrtdeEvaluateBatchFn = unsafe extern "C" fn(
+        points: *const f64,
+        point_count: usize,
+        dim: usize,
+        fitness_out: *mut f64,
+        user_data: *mut c_void,
+    ) -> i32;
+
+    /// C ABI solver configuration.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct LsrtdeConfig {
+        pub dim: usize,
+        pub lower_bounds: *const f64,
+        pub upper_bounds: *const f64,
+        pub max_evaluations: usize,
+        pub memory_size: usize,
+        pub pop_size_multiplier: usize,
+        pub seed: u64,
+        pub use_seed: u8,
     }
 
-    let config = unsafe { &*config };
-
-    if config.dim == 0 {
-        return LSRTDE_INVALID_DIMENSION;
-    }
-
-    if config.lower_bounds.is_null() || config.upper_bounds.is_null() {
-        return LSRTDE_NULL_BOUNDS;
-    }
-
-    let callback = match evaluate_batch {
-        Some(callback) => callback,
-        None => return LSRTDE_NULL_CALLBACK,
-    };
-
-    if best_genome_out.is_null() || best_fitness_out.is_null() {
-        return LSRTDE_NULL_OUTPUT;
-    }
-
-    let lower_bounds = unsafe { std::slice::from_raw_parts(config.lower_bounds, config.dim) };
-    let upper_bounds = unsafe { std::slice::from_raw_parts(config.upper_bounds, config.dim) };
-
-    let max_evaluations = if config.max_evaluations == 0 {
-        DEFAULT_MAX_EVALUATIONS
-    } else {
-        config.max_evaluations
-    };
-    let memory_size = if config.memory_size == 0 {
-        DEFAULT_MEMORY_SIZE
-    } else {
-        config.memory_size
-    };
-    let pop_size_multiplier = if config.pop_size_multiplier == 0 {
-        DEFAULT_POP_SIZE_MULTIPLIER
-    } else {
-        config.pop_size_multiplier
-    };
-
-    let validated_config = match validate_ffi_problem_config(
-        config.dim,
-        lower_bounds,
-        upper_bounds,
-        pop_size_multiplier,
-    ) {
-        Ok(config) => config,
-        Err(code) => return code,
-    };
-
-    let settings = RunSettings {
-        max_evaluations,
-        memory_size,
-        seed: (config.use_seed != 0).then_some(config.seed),
-    };
-
-    let mut evaluator = FfiEvaluator {
-        callback,
-        user_data,
-    };
-
-    match run_validated_with_evaluator(validated_config, settings, &mut evaluator, |_, _| true) {
-        Ok(solution) => {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    solution.genome.as_ptr(),
-                    best_genome_out,
-                    solution.genome.len(),
-                );
-                *best_fitness_out = solution.fitness;
-            }
-            LSRTDE_OK
+    /// Runs L-SRTDE through the C ABI.
+    ///
+    /// The caller owns all pointed-to memory. `best_genome_out` must have room
+    /// for `config->dim` doubles.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lsrtde_minimize(
+        config: *const LsrtdeConfig,
+        evaluate_batch: Option<LsrtdeEvaluateBatchFn>,
+        user_data: *mut c_void,
+        best_genome_out: *mut f64,
+        best_fitness_out: *mut f64,
+    ) -> i32 {
+        if config.is_null() {
+            return LSRTDE_NULL_CONFIG;
         }
-        Err(FfiEvaluationError::Callback) => LSRTDE_CALLBACK_ERROR,
-        Err(FfiEvaluationError::NonFiniteFitness) => LSRTDE_NONFINITE_FITNESS,
-    }
-}
 
-/// Returns a static message for a C ABI status code.
-#[unsafe(no_mangle)]
-pub extern "C" fn lsrtde_error_message(code: i32) -> *const c_char {
-    fn message(bytes: &'static [u8]) -> *const c_char {
-        bytes.as_ptr().cast()
+        let config = unsafe { &*config };
+
+        if config.dim == 0 {
+            return LSRTDE_INVALID_DIMENSION;
+        }
+
+        if config.lower_bounds.is_null() || config.upper_bounds.is_null() {
+            return LSRTDE_NULL_BOUNDS;
+        }
+
+        let callback = match evaluate_batch {
+            Some(callback) => callback,
+            None => return LSRTDE_NULL_CALLBACK,
+        };
+
+        if best_genome_out.is_null() || best_fitness_out.is_null() {
+            return LSRTDE_NULL_OUTPUT;
+        }
+
+        let lower_bounds = unsafe { std::slice::from_raw_parts(config.lower_bounds, config.dim) };
+        let upper_bounds = unsafe { std::slice::from_raw_parts(config.upper_bounds, config.dim) };
+
+        let max_evaluations = if config.max_evaluations == 0 {
+            DEFAULT_MAX_EVALUATIONS
+        } else {
+            config.max_evaluations
+        };
+        let memory_size = if config.memory_size == 0 {
+            DEFAULT_MEMORY_SIZE
+        } else {
+            config.memory_size
+        };
+        let pop_size_multiplier = if config.pop_size_multiplier == 0 {
+            DEFAULT_POP_SIZE_MULTIPLIER
+        } else {
+            config.pop_size_multiplier
+        };
+
+        let validated_config = match validate_ffi_problem_config(
+            config.dim,
+            lower_bounds,
+            upper_bounds,
+            pop_size_multiplier,
+        ) {
+            Ok(config) => config,
+            Err(code) => return code,
+        };
+
+        let settings = RunSettings {
+            max_evaluations,
+            memory_size,
+            seed: (config.use_seed != 0).then_some(config.seed),
+        };
+
+        let mut evaluator = FfiEvaluator {
+            callback,
+            user_data,
+        };
+
+        match run_validated_with_evaluator(validated_config, settings, &mut evaluator, |_, _| true)
+        {
+            Ok(solution) => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        solution.genome.as_ptr(),
+                        best_genome_out,
+                        solution.genome.len(),
+                    );
+                    *best_fitness_out = solution.fitness;
+                }
+                LSRTDE_OK
+            }
+            Err(FfiEvaluationError::Callback) => LSRTDE_CALLBACK_ERROR,
+            Err(FfiEvaluationError::NonFiniteFitness) => LSRTDE_NONFINITE_FITNESS,
+        }
     }
 
-    match code {
-        LSRTDE_OK => message(b"success\0"),
-        LSRTDE_NULL_CONFIG => message(b"config pointer is null\0"),
-        LSRTDE_NULL_BOUNDS => message(b"lower_bounds or upper_bounds pointer is null\0"),
-        LSRTDE_NULL_CALLBACK => message(b"evaluate_batch callback is null\0"),
-        LSRTDE_NULL_OUTPUT => message(b"output pointer is null\0"),
-        LSRTDE_INVALID_DIMENSION => message(b"dimension must be greater than zero\0"),
-        LSRTDE_POPULATION_OVERFLOW => message(b"initial population size overflowed\0"),
-        LSRTDE_POPULATION_TOO_SMALL => message(b"initial population size is too small\0"),
-        LSRTDE_INVALID_BOUNDS => message(b"bounds must be finite and satisfy lower < upper\0"),
-        LSRTDE_CALLBACK_ERROR => message(b"evaluate_batch callback returned an error\0"),
-        LSRTDE_NONFINITE_FITNESS => message(b"evaluate_batch returned a non-finite fitness\0"),
-        _ => message(b"unknown l_srtde error code\0"),
+    /// Returns a static message for a C ABI status code.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lsrtde_error_message(code: i32) -> *const c_char {
+        fn message(bytes: &'static [u8]) -> *const c_char {
+            bytes.as_ptr().cast()
+        }
+
+        match code {
+            LSRTDE_OK => message(b"success\0"),
+            LSRTDE_NULL_CONFIG => message(b"config pointer is null\0"),
+            LSRTDE_NULL_BOUNDS => message(b"lower_bounds or upper_bounds pointer is null\0"),
+            LSRTDE_NULL_CALLBACK => message(b"evaluate_batch callback is null\0"),
+            LSRTDE_NULL_OUTPUT => message(b"output pointer is null\0"),
+            LSRTDE_INVALID_DIMENSION => message(b"dimension must be greater than zero\0"),
+            LSRTDE_POPULATION_OVERFLOW => message(b"initial population size overflowed\0"),
+            LSRTDE_POPULATION_TOO_SMALL => message(b"initial population size is too small\0"),
+            LSRTDE_INVALID_BOUNDS => message(b"bounds must be finite and satisfy lower < upper\0"),
+            LSRTDE_CALLBACK_ERROR => message(b"evaluate_batch callback returned an error\0"),
+            LSRTDE_NONFINITE_FITNESS => message(b"evaluate_batch returned a non-finite fitness\0"),
+            _ => message(b"unknown l_srtde error code\0"),
+        }
     }
 }
 

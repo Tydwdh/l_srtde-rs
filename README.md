@@ -1,5 +1,7 @@
 # l_srtde
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 
@@ -32,7 +34,7 @@ If you use the algorithm or this code in research, cite the original paper:
 
 ```toml
 [dependencies]
-l_srtde = "0.1.2"
+l_srtde = "0.1.3"
 ```
 
 ## Quick Start
