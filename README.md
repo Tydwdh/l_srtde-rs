@@ -34,7 +34,7 @@ If you use the algorithm or this code in research, cite the original paper:
 
 ```toml
 [dependencies]
-l_srtde = "0.1.3"
+l_srtde = "0.2.0"
 ```
 
 ## Quick Start
@@ -143,8 +143,10 @@ static int32_t sphere_batch(
 ```
 
 The callback receives a row-major batch of `point_count * dim` doubles and must
-write `point_count` fitness values. Return `0` on success and a non-zero value
-to stop the optimization with `LSRTDE_CALLBACK_ERROR`.
+write `point_count` finite fitness values. Return `0` on success and a non-zero
+value to stop the optimization with `LSRTDE_CALLBACK_ERROR`. The input and
+output pointers are valid only for the duration of the callback and must not be
+retained after it returns.
 
 Example link commands:
 
@@ -199,7 +201,11 @@ The current validation rules are:
 - `memory_size > 0`
 - `dimension * pop_size_multiplier` must not overflow
 - initial population size must be at least `3`
-- every `(lower, upper)` bound pair must be finite and satisfy `lower < upper`
+- every `(lower, upper)` bound pair must be finite, satisfy `lower < upper`, and
+  have a finite width (`upper - lower`)
+- objective evaluations must return finite fitness values; Rust returns
+  `LsrtdeError::NonFiniteFitness` and the C ABI returns
+  `LSRTDE_NONFINITE_FITNESS`
 
 `with_max_evaluations()` is a soft budget, not a hard cap:
 

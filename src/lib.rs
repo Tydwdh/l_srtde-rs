@@ -15,9 +15,9 @@
 //!
 //! `with_max_evaluations()` configures a soft budget, not a strict hard limit.
 //! The solver always evaluates the full initial population first, and each
-//! generation evaluates a full batch of trial vectors in parallel before the
-//! budget check is applied to accepted children. As a result, the total number
-//! of calls to [`Problem::evaluate`] may exceed the configured value.
+//! generation evaluates a full batch of trial vectors in parallel. As a result,
+//! the total number of calls to [`Problem::evaluate`] may exceed the configured
+//! value by up to one generation.
 //!
 //! ## Quick Start
 //!
@@ -122,11 +122,12 @@ pub struct Solution {
     pub fitness: f64,
 }
 
-/// Errors returned when the solver configuration is invalid.
+/// Errors returned by the solver.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LsrtdeError {
     ZeroDimension,
     ZeroMemorySize,
+    NonFiniteFitness,
     PopulationSizeOverflow,
     PopulationTooSmall {
         population_size: usize,
@@ -144,6 +145,9 @@ impl fmt::Display for LsrtdeError {
         match self {
             Self::ZeroDimension => write!(f, "problem dimension must be greater than zero"),
             Self::ZeroMemorySize => write!(f, "memory_size must be greater than zero"),
+            Self::NonFiniteFitness => {
+                write!(f, "objective evaluation returned a non-finite fitness")
+            }
             Self::PopulationSizeOverflow => write!(
                 f,
                 "initial population size overflowed usize when computing dimension * multiplier"
@@ -161,7 +165,7 @@ impl fmt::Display for LsrtdeError {
                 upper,
             } => write!(
                 f,
-                "invalid bounds at dimension {index}: expected finite lower < upper, got ({lower}, {upper})"
+                "invalid bounds at dimension {index}: expected finite lower < upper with finite width, got ({lower}, {upper})"
             ),
         }
     }
@@ -182,6 +186,29 @@ trait CandidateEvaluator {
     -> Result<(), Self::Error>;
 }
 
+struct NativeEvaluator<'a, P: Problem> {
+    problem: &'a P,
+}
+
+impl<P: Problem> CandidateEvaluator for NativeEvaluator<'_, P> {
+    type Error = LsrtdeError;
+
+    fn evaluate(
+        &mut self,
+        candidates: &mut [Individual],
+        _n_vars: usize,
+    ) -> Result<(), Self::Error> {
+        candidates.par_iter_mut().try_for_each(|candidate| {
+            let fitness = self.problem.evaluate(&candidate.genome);
+            if !fitness.is_finite() {
+                return Err(LsrtdeError::NonFiniteFitness);
+            }
+            candidate.fitness = fitness;
+            Ok(())
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FfiEvaluationError {
     Callback,
@@ -191,6 +218,8 @@ enum FfiEvaluationError {
 struct FfiEvaluator {
     callback: ffi::LsrtdeEvaluateBatchFn,
     user_data: *mut c_void,
+    points: Vec<f64>,
+    fitness: Vec<f64>,
 }
 
 impl CandidateEvaluator for FfiEvaluator {
@@ -205,18 +234,18 @@ impl CandidateEvaluator for FfiEvaluator {
             return Ok(());
         }
 
-        let mut points = Vec::new();
+        self.points.clear();
         for candidate in candidates.iter() {
-            points.extend_from_slice(&candidate.genome);
+            self.points.extend_from_slice(&candidate.genome);
         }
 
-        let mut fitness = vec![0.0; candidates.len()];
+        self.fitness.resize(candidates.len(), 0.0);
         let status = unsafe {
             (self.callback)(
-                points.as_ptr(),
+                self.points.as_ptr(),
                 candidates.len(),
                 n_vars,
-                fitness.as_mut_ptr(),
+                self.fitness.as_mut_ptr(),
                 self.user_data,
             )
         };
@@ -225,7 +254,7 @@ impl CandidateEvaluator for FfiEvaluator {
             return Err(FfiEvaluationError::Callback);
         }
 
-        for (candidate, fitness) in candidates.iter_mut().zip(fitness) {
+        for (candidate, &fitness) in candidates.iter_mut().zip(&self.fitness) {
             if !fitness.is_finite() {
                 return Err(FfiEvaluationError::NonFiniteFitness);
             }
@@ -264,6 +293,16 @@ struct ValidatedConfig {
     n_vars: usize,
     pop_size_init: usize,
     bounds: Vec<(f64, f64)>,
+}
+
+#[inline]
+fn normalized_fitness_delta(lhs: f64, rhs: f64) -> f64 {
+    let scale = lhs.abs().max(rhs.abs());
+    if scale == 0.0 {
+        0.0
+    } else {
+        (lhs / scale - rhs / scale).abs()
+    }
 }
 
 impl<'a, P: Problem> Lsrtde<'a, P> {
@@ -319,8 +358,9 @@ impl<'a, P: Problem> Lsrtde<'a, P> {
 
     /// Runs the solver and invokes a callback once per generation.
     ///
-    /// The callback receives the current best solution and the accepted
-    /// evaluation counter. Returning `false` stops the search early.
+    /// The callback receives the current best solution and the number of
+    /// objective evaluations accounted for so far. Returning `false` stops the
+    /// search early.
     ///
     /// The soft-budget semantics are the same as [`Lsrtde::with_max_evaluations`]:
     /// the total number of objective evaluations can exceed the configured
@@ -330,236 +370,16 @@ impl<'a, P: Problem> Lsrtde<'a, P> {
         F: FnMut(&Solution, usize) -> bool,
     {
         let config = self.validate_config()?;
-        let n_vars = config.n_vars;
-        let max_feval = self.max_evaluations;
-        let bounds = config.bounds;
-
-        let master_seed = self.seed.unwrap_or_else(|| rand::rng().random());
-        let mut master_rng = StdRng::seed_from_u64(master_seed);
-
-        let pop_size_init = config.pop_size_init;
-        let mut n_inds_front = pop_size_init;
-        let n_inds_front_max = pop_size_init;
-        let n_inds_min = 4.min(pop_size_init);
-
-        let mut popul: Vec<Individual> = Vec::with_capacity(pop_size_init * 2);
-
-        for _ in 0..pop_size_init {
-            let genome: Vec<f64> = bounds
-                .iter()
-                .map(|&(lower, upper)| master_rng.random_range(lower..upper))
-                .collect();
-            popul.push(Individual {
-                genome,
-                fitness: f64::INFINITY,
-            });
-        }
-
-        let mut memory_cr = vec![1.0f64; self.memory_size];
-        let mut memory_iter = 0;
-        let mut success_rate = 0.5_f64;
-
-        popul.par_iter_mut().for_each(|ind| {
-            ind.fitness = self.problem.evaluate(&ind.genome);
-        });
-
-        let mut nf_eval = pop_size_init;
-
-        let mut global_best_ind = popul[0].clone();
-        for ind in &popul {
-            if ind.fitness < global_best_ind.fitness {
-                global_best_ind = ind.clone();
-            }
-        }
-
-        while nf_eval < max_feval {
-            let current_sol = Solution {
-                genome: global_best_ind.genome.clone(),
-                fitness: global_best_ind.fitness,
-            };
-            if !callback(&current_sol, nf_eval) {
-                break;
-            }
-
-            popul.sort_by(|a, b| a.fitness.total_cmp(&b.fitness));
-
-            let progress = nf_eval as f64 / max_feval as f64;
-            let next_size_f = ((n_inds_min as f64 - n_inds_front_max as f64) * progress)
-                + n_inds_front_max as f64;
-            let next_size = next_size_f as usize;
-
-            if popul.len() > n_inds_front {
-                popul.truncate(n_inds_front);
-            }
-            n_inds_front = next_size.max(n_inds_min).min(popul.len());
-
-            if popul[0].fitness < global_best_ind.fitness {
-                global_best_ind = popul[0].clone();
-            }
-
-            let popul_front = popul.clone();
-            let mean_f = 0.4_f64 + (success_rate * 5.0_f64).tanh() * 0.25_f64;
-            let sigma_f = 0.02_f64;
-            let sigma_cr = 0.05_f64;
-
-            let dist_rank = if n_inds_front > 1 {
-                let weights: Vec<f64> = (0..n_inds_front)
-                    .map(|i| (-(i as f64) / n_inds_front as f64 * 3.0_f64).exp())
-                    .collect();
-                WeightedIndex::new(&weights).ok()
-            } else {
-                None
-            };
-
-            let p_size_val =
-                (n_inds_front as f64 * 0.7_f64 * (-success_rate * 7.0_f64).exp()) as usize;
-            let p_size_val = p_size_val.max(2).min(n_inds_front);
-
-            let seeds: Vec<u64> = (0..n_inds_front).map(|_| master_rng.random()).collect();
-
-            let results: Vec<_> = (0..n_inds_front)
-                .into_par_iter()
-                .zip(seeds.into_par_iter())
-                .map(|(i, seed)| {
-                    let mut local_rng = StdRng::seed_from_u64(seed);
-
-                    let target_idx = i;
-                    let mem_idx = local_rng.random_range(0..self.memory_size);
-
-                    let mut prand_idx;
-                    loop {
-                        prand_idx = local_rng.random_range(0..p_size_val);
-                        if prand_idx != target_idx {
-                            break;
-                        }
-                    }
-
-                    let mut rand1_idx;
-                    loop {
-                        if let Some(ref dist) = dist_rank {
-                            rand1_idx = dist.sample(&mut local_rng);
-                        } else {
-                            rand1_idx = local_rng.random_range(0..n_inds_front);
-                        }
-                        if rand1_idx != prand_idx {
-                            break;
-                        }
-                    }
-
-                    let mut rand2_idx;
-                    loop {
-                        rand2_idx = local_rng.random_range(0..n_inds_front);
-                        if rand2_idx != prand_idx && rand2_idx != rand1_idx {
-                            break;
-                        }
-                    }
-
-                    let mut f_val;
-                    loop {
-                        let z: f64 = local_rng.sample(StandardNormal);
-                        f_val = mean_f + sigma_f * z;
-                        if f_val >= 0.0 {
-                            f_val = f_val.min(1.0);
-                            break;
-                        }
-                    }
-
-                    let z_cr: f64 = local_rng.sample(StandardNormal);
-                    let mut cr_val = memory_cr[mem_idx] + sigma_cr * z_cr;
-                    cr_val = cr_val.clamp(0.0, 1.0);
-
-                    let x_target = &popul_front[target_idx].genome;
-                    let x_pbest = &popul_front[prand_idx].genome;
-                    let x_r1 = &popul_front[rand1_idx].genome;
-                    let x_r2 = &popul_front[rand2_idx].genome;
-
-                    let mut trial_genome = x_target.clone();
-                    let j_rand = local_rng.random_range(0..n_vars);
-
-                    for j in 0..n_vars {
-                        if local_rng.random_bool(cr_val) || j == j_rand {
-                            let val = x_target[j]
-                                + f_val * (x_pbest[j] - x_target[j])
-                                + f_val * (x_r1[j] - x_r2[j]);
-
-                            let (min_j, max_j) = bounds[j];
-                            if val < min_j || val > max_j {
-                                trial_genome[j] = local_rng.random_range(min_j..max_j);
-                            } else {
-                                trial_genome[j] = val;
-                            }
-                        }
-                    }
-
-                    let trial_fit = self.problem.evaluate(&trial_genome);
-
-                    (
-                        target_idx,
-                        Individual {
-                            genome: trial_genome,
-                            fitness: trial_fit,
-                        },
-                        cr_val,
-                    )
-                })
-                .collect();
-
-            let mut success_cr_list = Vec::new();
-            let mut fit_delta_list = Vec::new();
-            let mut new_children = Vec::new();
-
-            for (target_idx, trial_ind, cr_val) in results {
-                nf_eval += 1;
-
-                if trial_ind.fitness <= popul_front[target_idx].fitness {
-                    if trial_ind.fitness < global_best_ind.fitness {
-                        global_best_ind = trial_ind.clone();
-                    }
-                    if trial_ind.fitness < popul_front[target_idx].fitness {
-                        success_cr_list.push(cr_val);
-                        fit_delta_list
-                            .push((popul_front[target_idx].fitness - trial_ind.fitness).abs());
-                    }
-                    new_children.push(trial_ind);
-                }
-
-                if nf_eval >= max_feval {
-                    break;
-                }
-            }
-
-            let success_count = new_children.len();
-            success_rate = success_count as f64 / n_inds_front as f64;
-
-            popul.extend(new_children);
-
-            if success_count > 0 {
-                let sum_w: f64 = fit_delta_list.iter().sum();
-                if sum_w > 1e-10 {
-                    let mut mean_wl_cr = 0.0;
-                    let mut sum_w_sq = 0.0;
-
-                    for i in 0..success_cr_list.len() {
-                        let w = fit_delta_list[i] / sum_w;
-                        mean_wl_cr += w * success_cr_list[i] * success_cr_list[i];
-                        sum_w_sq += w * success_cr_list[i];
-                    }
-
-                    let new_cr = if sum_w_sq > 0.0 {
-                        mean_wl_cr / sum_w_sq
-                    } else {
-                        0.5
-                    };
-
-                    memory_cr[memory_iter] = 0.5 * new_cr + 0.5 * memory_cr[memory_iter];
-                    memory_iter = (memory_iter + 1) % self.memory_size;
-                }
-            }
-        }
-
-        Ok(Solution {
-            genome: global_best_ind.genome,
-            fitness: global_best_ind.fitness,
+        let settings = RunSettings {
+            max_evaluations: self.max_evaluations,
+            memory_size: self.memory_size,
+            seed: self.seed,
+        };
+        let mut evaluator = NativeEvaluator {
+            problem: self.problem,
+        };
+        run_validated_with_evaluator(config, settings, &mut evaluator, |solution, evaluations| {
+            callback(solution, evaluations)
         })
     }
 
@@ -588,7 +408,11 @@ impl<'a, P: Problem> Lsrtde<'a, P> {
         let mut bounds = Vec::with_capacity(n_vars);
         for index in 0..n_vars {
             let (lower, upper) = self.problem.get_bounds(index);
-            if !lower.is_finite() || !upper.is_finite() || lower >= upper {
+            if !lower.is_finite()
+                || !upper.is_finite()
+                || lower >= upper
+                || !(upper - lower).is_finite()
+            {
                 return Err(LsrtdeError::InvalidBounds {
                     index,
                     lower,
@@ -628,8 +452,7 @@ where
     let n_inds_front_max = pop_size_init;
     let n_inds_min = 4.min(pop_size_init);
 
-    let mut popul: Vec<Individual> =
-        Vec::with_capacity(pop_size_init.checked_mul(2).unwrap_or(pop_size_init));
+    let mut popul: Vec<Individual> = Vec::with_capacity(pop_size_init);
 
     for _ in 0..pop_size_init {
         let genome: Vec<f64> = bounds
@@ -682,7 +505,7 @@ where
             global_best_ind = popul[0].clone();
         }
 
-        let popul_front = popul.clone();
+        let popul_front = &popul;
         let mean_f = 0.4_f64 + (success_rate * 5.0_f64).tanh() * 0.25_f64;
         let sigma_f = 0.02_f64;
         let sigma_cr = 0.05_f64;
@@ -788,29 +611,27 @@ where
         let (mut trial_individuals, cr_values): (Vec<_>, Vec<_>) = trial_data.into_iter().unzip();
         evaluator.evaluate(&mut trial_individuals, n_vars)?;
 
-        let mut success_cr_list = Vec::new();
-        let mut fit_delta_list = Vec::new();
-        let mut new_children = Vec::new();
+        let mut success_cr_list = Vec::with_capacity(n_inds_front);
+        let mut fit_delta_list = Vec::with_capacity(n_inds_front);
+        let mut new_children = Vec::with_capacity(n_inds_front);
+
+        nf_eval += trial_individuals.len();
 
         for (target_idx, (trial_ind, cr_val)) in
             trial_individuals.into_iter().zip(cr_values).enumerate()
         {
-            nf_eval += 1;
-
             if trial_ind.fitness <= popul_front[target_idx].fitness {
                 if trial_ind.fitness < global_best_ind.fitness {
                     global_best_ind = trial_ind.clone();
                 }
                 if trial_ind.fitness < popul_front[target_idx].fitness {
                     success_cr_list.push(cr_val);
-                    fit_delta_list
-                        .push((popul_front[target_idx].fitness - trial_ind.fitness).abs());
+                    fit_delta_list.push(normalized_fitness_delta(
+                        popul_front[target_idx].fitness,
+                        trial_ind.fitness,
+                    ));
                 }
                 new_children.push(trial_ind);
-            }
-
-            if nf_eval >= max_feval {
-                break;
             }
         }
 
@@ -871,7 +692,11 @@ fn validate_ffi_problem_config(
     for index in 0..dim {
         let lower = lower_bounds[index];
         let upper = upper_bounds[index];
-        if !lower.is_finite() || !upper.is_finite() || lower >= upper {
+        if !lower.is_finite()
+            || !upper.is_finite()
+            || lower >= upper
+            || !(upper - lower).is_finite()
+        {
             return Err(ffi::LSRTDE_INVALID_BOUNDS);
         }
         bounds.push((lower, upper));
@@ -951,8 +776,15 @@ pub mod ffi {
     ///
     /// The caller owns all pointed-to memory. `best_genome_out` must have room
     /// for `config->dim` doubles.
+    ///
+    /// # Safety
+    ///
+    /// The caller must provide a valid `config` pointer, bounds arrays of
+    /// `config->dim` elements, and writable output buffers of the documented
+    /// sizes. The callback must obey the callback contract and must not unwind
+    /// across the C ABI boundary.
     #[unsafe(no_mangle)]
-    pub extern "C" fn lsrtde_minimize(
+    pub unsafe extern "C" fn lsrtde_minimize(
         config: *const LsrtdeConfig,
         evaluate_batch: Option<LsrtdeEvaluateBatchFn>,
         user_data: *mut c_void,
@@ -1020,6 +852,8 @@ pub mod ffi {
         let mut evaluator = FfiEvaluator {
             callback,
             user_data,
+            points: Vec::new(),
+            fitness: Vec::new(),
         };
 
         match run_validated_with_evaluator(validated_config, settings, &mut evaluator, |_, _| true)
@@ -1056,7 +890,9 @@ pub mod ffi {
             LSRTDE_INVALID_DIMENSION => message(b"dimension must be greater than zero\0"),
             LSRTDE_POPULATION_OVERFLOW => message(b"initial population size overflowed\0"),
             LSRTDE_POPULATION_TOO_SMALL => message(b"initial population size is too small\0"),
-            LSRTDE_INVALID_BOUNDS => message(b"bounds must be finite and satisfy lower < upper\0"),
+            LSRTDE_INVALID_BOUNDS => {
+                message(b"bounds must be finite, satisfy lower < upper, and have finite width\0")
+            }
             LSRTDE_CALLBACK_ERROR => message(b"evaluate_batch callback returned an error\0"),
             LSRTDE_NONFINITE_FITNESS => message(b"evaluate_batch returned a non-finite fitness\0"),
             _ => message(b"unknown l_srtde error code\0"),
@@ -1070,6 +906,7 @@ mod tests {
     use std::ptr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::normalized_fitness_delta;
     use super::{
         LSRTDE_CALLBACK_ERROR, LSRTDE_INVALID_BOUNDS, LSRTDE_NONFINITE_FITNESS, LSRTDE_NULL_BOUNDS,
         LSRTDE_NULL_CALLBACK, LSRTDE_NULL_CONFIG, LSRTDE_NULL_OUTPUT, LSRTDE_OK, Lsrtde,
@@ -1143,6 +980,24 @@ mod tests {
 
         fn evaluate(&self, genome: &[f64]) -> f64 {
             genome.iter().sum()
+        }
+    }
+
+    struct NonFiniteProblem {
+        dim: usize,
+    }
+
+    impl Problem for NonFiniteProblem {
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+
+        fn get_bounds(&self, _index: usize) -> (f64, f64) {
+            (-1.0, 1.0)
+        }
+
+        fn evaluate(&self, _genome: &[f64]) -> f64 {
+            f64::NAN
         }
     }
 
@@ -1253,6 +1108,42 @@ mod tests {
     }
 
     #[test]
+    fn rejects_bounds_with_non_finite_width() {
+        let problem = InvalidBoundsProblem {
+            dim: 1,
+            bounds: (f64::MIN, f64::MAX),
+        };
+
+        let err = Lsrtde::new(&problem).run().unwrap_err();
+
+        assert_eq!(
+            err,
+            LsrtdeError::InvalidBounds {
+                index: 0,
+                lower: f64::MIN,
+                upper: f64::MAX,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_nonfinite_native_fitness() {
+        let problem = NonFiniteProblem { dim: 3 };
+
+        let err = Lsrtde::new(&problem).run().unwrap_err();
+
+        assert_eq!(err, LsrtdeError::NonFiniteFitness);
+    }
+
+    #[test]
+    fn normalizes_extreme_fitness_deltas_without_overflow() {
+        let delta = normalized_fitness_delta(f64::MAX, -f64::MAX);
+
+        assert!(delta.is_finite());
+        assert_eq!(delta, 2.0);
+    }
+
+    #[test]
     fn max_evaluations_is_a_soft_budget() {
         let problem = CountingProblem::new(10);
 
@@ -1260,6 +1151,21 @@ mod tests {
 
         assert!(solution.fitness.is_finite());
         assert_eq!(problem.evaluations(), 180);
+    }
+
+    #[test]
+    fn soft_budget_processes_the_complete_evaluated_batch() {
+        let problem = CountingProblem::new(1);
+
+        let solution = Lsrtde::new(&problem)
+            .with_pop_size_multiplier(3)
+            .with_max_evaluations(4)
+            .with_seed(7)
+            .run()
+            .unwrap();
+
+        assert!(solution.fitness.is_finite());
+        assert_eq!(problem.evaluations(), 6);
     }
 
     unsafe extern "C" fn sphere_batch_callback(
@@ -1272,9 +1178,9 @@ mod tests {
         let points = unsafe { std::slice::from_raw_parts(points, point_count * dim) };
         let fitness_out = unsafe { std::slice::from_raw_parts_mut(fitness_out, point_count) };
 
-        for i in 0..point_count {
+        for (i, fitness) in fitness_out.iter_mut().enumerate() {
             let start = i * dim;
-            fitness_out[i] = points[start..start + dim].iter().map(|x| x * x).sum();
+            *fitness = points[start..start + dim].iter().map(|x| x * x).sum();
         }
 
         LSRTDE_OK
@@ -1317,6 +1223,24 @@ mod tests {
         }
     }
 
+    unsafe fn call_lsrtde(
+        config: *const LsrtdeConfig,
+        evaluate_batch: Option<super::LsrtdeEvaluateBatchFn>,
+        user_data: *mut c_void,
+        best_genome_out: *mut f64,
+        best_fitness_out: *mut f64,
+    ) -> i32 {
+        unsafe {
+            lsrtde_minimize(
+                config,
+                evaluate_batch,
+                user_data,
+                best_genome_out,
+                best_fitness_out,
+            )
+        }
+    }
+
     #[test]
     fn ffi_minimizes_sphere_with_batch_callback() {
         let lower = vec![-5.0; 3];
@@ -1325,13 +1249,15 @@ mod tests {
         let mut best_genome = vec![0.0; config.dim];
         let mut best_fitness = f64::INFINITY;
 
-        let status = lsrtde_minimize(
-            &config,
-            Some(sphere_batch_callback),
-            ptr::null_mut(),
-            best_genome.as_mut_ptr(),
-            &mut best_fitness,
-        );
+        let status = unsafe {
+            call_lsrtde(
+                &config,
+                Some(sphere_batch_callback),
+                ptr::null_mut(),
+                best_genome.as_mut_ptr(),
+                &mut best_fitness,
+            )
+        };
 
         assert_eq!(status, LSRTDE_OK);
         assert!(best_fitness.is_finite());
@@ -1348,48 +1274,56 @@ mod tests {
         let mut best_fitness = 0.0;
 
         assert_eq!(
-            lsrtde_minimize(
-                ptr::null(),
-                Some(sphere_batch_callback),
-                ptr::null_mut(),
-                best_genome.as_mut_ptr(),
-                &mut best_fitness,
-            ),
+            unsafe {
+                call_lsrtde(
+                    ptr::null(),
+                    Some(sphere_batch_callback),
+                    ptr::null_mut(),
+                    best_genome.as_mut_ptr(),
+                    &mut best_fitness,
+                )
+            },
             LSRTDE_NULL_CONFIG,
         );
 
         config.lower_bounds = ptr::null();
         assert_eq!(
-            lsrtde_minimize(
-                &config,
-                Some(sphere_batch_callback),
-                ptr::null_mut(),
-                best_genome.as_mut_ptr(),
-                &mut best_fitness,
-            ),
+            unsafe {
+                call_lsrtde(
+                    &config,
+                    Some(sphere_batch_callback),
+                    ptr::null_mut(),
+                    best_genome.as_mut_ptr(),
+                    &mut best_fitness,
+                )
+            },
             LSRTDE_NULL_BOUNDS,
         );
 
         config.lower_bounds = lower.as_ptr();
         assert_eq!(
-            lsrtde_minimize(
-                &config,
-                None,
-                ptr::null_mut(),
-                best_genome.as_mut_ptr(),
-                &mut best_fitness,
-            ),
+            unsafe {
+                call_lsrtde(
+                    &config,
+                    None,
+                    ptr::null_mut(),
+                    best_genome.as_mut_ptr(),
+                    &mut best_fitness,
+                )
+            },
             LSRTDE_NULL_CALLBACK,
         );
 
         assert_eq!(
-            lsrtde_minimize(
-                &config,
-                Some(sphere_batch_callback),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut best_fitness,
-            ),
+            unsafe {
+                call_lsrtde(
+                    &config,
+                    Some(sphere_batch_callback),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut best_fitness,
+                )
+            },
             LSRTDE_NULL_OUTPUT,
         );
     }
@@ -1402,13 +1336,36 @@ mod tests {
         let mut best_genome = vec![0.0; config.dim];
         let mut best_fitness = 0.0;
 
-        let status = lsrtde_minimize(
-            &config,
-            Some(sphere_batch_callback),
-            ptr::null_mut(),
-            best_genome.as_mut_ptr(),
-            &mut best_fitness,
-        );
+        let status = unsafe {
+            call_lsrtde(
+                &config,
+                Some(sphere_batch_callback),
+                ptr::null_mut(),
+                best_genome.as_mut_ptr(),
+                &mut best_fitness,
+            )
+        };
+
+        assert_eq!(status, LSRTDE_INVALID_BOUNDS);
+    }
+
+    #[test]
+    fn ffi_rejects_bounds_with_non_finite_width() {
+        let lower = vec![f64::MIN; 3];
+        let upper = vec![f64::MAX; 3];
+        let config = ffi_config(&lower, &upper);
+        let mut best_genome = vec![0.0; config.dim];
+        let mut best_fitness = 0.0;
+
+        let status = unsafe {
+            call_lsrtde(
+                &config,
+                Some(sphere_batch_callback),
+                ptr::null_mut(),
+                best_genome.as_mut_ptr(),
+                &mut best_fitness,
+            )
+        };
 
         assert_eq!(status, LSRTDE_INVALID_BOUNDS);
     }
@@ -1421,13 +1378,15 @@ mod tests {
         let mut best_genome = vec![0.0; config.dim];
         let mut best_fitness = 0.0;
 
-        let status = lsrtde_minimize(
-            &config,
-            Some(failing_batch_callback),
-            ptr::null_mut(),
-            best_genome.as_mut_ptr(),
-            &mut best_fitness,
-        );
+        let status = unsafe {
+            call_lsrtde(
+                &config,
+                Some(failing_batch_callback),
+                ptr::null_mut(),
+                best_genome.as_mut_ptr(),
+                &mut best_fitness,
+            )
+        };
 
         assert_eq!(status, LSRTDE_CALLBACK_ERROR);
     }
@@ -1440,13 +1399,15 @@ mod tests {
         let mut best_genome = vec![0.0; config.dim];
         let mut best_fitness = 0.0;
 
-        let status = lsrtde_minimize(
-            &config,
-            Some(nonfinite_batch_callback),
-            ptr::null_mut(),
-            best_genome.as_mut_ptr(),
-            &mut best_fitness,
-        );
+        let status = unsafe {
+            call_lsrtde(
+                &config,
+                Some(nonfinite_batch_callback),
+                ptr::null_mut(),
+                best_genome.as_mut_ptr(),
+                &mut best_fitness,
+            )
+        };
 
         assert_eq!(status, LSRTDE_NONFINITE_FITNESS);
     }

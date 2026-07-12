@@ -24,7 +24,7 @@ Rust 项目中直接使用：
 
 ```toml
 [dependencies]
-l_srtde = "0.1.3"
+l_srtde = "0.2.0"
 ```
 
 ## Rust 快速开始
@@ -139,7 +139,7 @@ callback 收到的是 row-major 连续数组，长度为 `point_count * dim`。�
 points[i * dim + j]
 ```
 
-callback 需要写出 `point_count` 个 fitness：
+callback 需要写出 `point_count` 个有限 fitness；输入输出指针只在 callback 调用期间有效，不应保存到调用返回之后：
 
 ```c
 fitness_out[i] = value;
@@ -254,6 +254,10 @@ print("best fitness:", best_fitness.value)
 print("best x:", list(best_x))
 ```
 
+C ABI 配置中的 `max_evaluations`、`memory_size` 和 `pop_size_multiplier`
+如果设为 `0`，会使用 Rust 默认值；`use_seed=0` 使用随机种子，非零值使用
+`seed` 字段。
+
 ## 校验规则和评估预算
 
 `run()` 和 `run_with_callback()` 返回 `Result<_, LsrtdeError>`。求解器会在并行评估开始前拒绝非法配置。
@@ -264,7 +268,8 @@ print("best x:", list(best_x))
 - `memory_size > 0`
 - `dimension * pop_size_multiplier` 不能发生整数溢出
 - 初始种群规模至少为 `3`
-- 每一维的 `(lower, upper)` 必须是有限数，并且满足 `lower < upper`
+- 每一维的 `(lower, upper)` 必须是有限数，满足 `lower < upper`，且宽度 `upper - lower` 也必须有限
+- 目标函数必须返回有限 fitness；Rust API 返回 `LsrtdeError::NonFiniteFitness`，C ABI 返回 `LSRTDE_NONFINITE_FITNESS`
 
 `with_max_evaluations()` 是软预算，不是严格硬上限：
 

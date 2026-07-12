@@ -22,6 +22,10 @@ enum {
     LSRTDE_NONFINITE_FITNESS = 10
 };
 
+/*
+ * The input/output pointers are valid only during the callback. The callback
+ * must write point_count finite values and return 0 on success.
+ */
 typedef int32_t (*lsrtde_evaluate_batch_fn)(
     const double *points,
     size_t point_count,
@@ -41,6 +45,12 @@ typedef struct {
     uint8_t use_seed;
 } lsrtde_config;
 
+/*
+ * config->lower_bounds and config->upper_bounds each contain config->dim
+ * elements. best_genome_out contains config->dim writable doubles and
+ * best_fitness_out points to one writable double. All pointers must be valid
+ * for the duration of this call.
+ */
 int32_t lsrtde_minimize(
     const lsrtde_config *config,
     lsrtde_evaluate_batch_fn evaluate_batch,
